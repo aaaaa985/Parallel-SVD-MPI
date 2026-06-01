@@ -82,14 +82,111 @@ namespace
 
     static void make_nonnegative_and_sort(Matrix &U, Matrix &B, Matrix &V);
 
+    // MPI 任务池调度策略。
+    // 0: 大块优先（默认主版本）；1: FIFO 动态队列；2: 小块优先。
+    // 编译示例：
+    //   -DGKH_TASK_POLICY=1  启用 FIFO
+    //   -DGKH_TASK_POLICY=2  启用小块优先
+#ifndef GKH_TASK_POLICY
+#define GKH_TASK_POLICY 0
+#endif
+
+    static int block_len(const Block &blk)
+    {
+        return blk.r - blk.l + 1;
+    }
+
     // 大块优先任务池：长度更大的 block 优先分配。
     struct BlockCmp
     {
         bool operator()(const Block &a, const Block &b) const
         {
-            return (a.r - a.l) < (b.r - b.l);
+            return block_len(a) < block_len(b);
         }
     };
+
+    // 小块优先任务池：长度更小的 block 优先分配，用作对照策略。
+    struct SmallBlockCmp
+    {
+        bool operator()(const Block &a, const Block &b) const
+        {
+            return block_len(a) > block_len(b);
+        }
+    };
+
+    class TaskPool
+    {
+    public:
+        void push(const Block &blk)
+        {
+#if GKH_TASK_POLICY == 1
+            fifo_queue_.push_back(blk);
+#elif GKH_TASK_POLICY == 2
+            small_first_queue_.push(blk);
+#else
+            large_first_queue_.push(blk);
+#endif
+        }
+
+        Block pop()
+        {
+#if GKH_TASK_POLICY == 1
+            Block blk = fifo_queue_.front();
+            fifo_queue_.pop_front();
+            return blk;
+#elif GKH_TASK_POLICY == 2
+            Block blk = small_first_queue_.top();
+            small_first_queue_.pop();
+            return blk;
+#else
+            Block blk = large_first_queue_.top();
+            large_first_queue_.pop();
+            return blk;
+#endif
+        }
+
+        bool empty() const
+        {
+#if GKH_TASK_POLICY == 1
+            return fifo_queue_.empty();
+#elif GKH_TASK_POLICY == 2
+            return small_first_queue_.empty();
+#else
+            return large_first_queue_.empty();
+#endif
+        }
+
+        int size() const
+        {
+#if GKH_TASK_POLICY == 1
+            return static_cast<int>(fifo_queue_.size());
+#elif GKH_TASK_POLICY == 2
+            return static_cast<int>(small_first_queue_.size());
+#else
+            return static_cast<int>(large_first_queue_.size());
+#endif
+        }
+
+    private:
+#if GKH_TASK_POLICY == 1
+        std::deque<Block> fifo_queue_;
+#elif GKH_TASK_POLICY == 2
+        std::priority_queue<Block, std::vector<Block>, SmallBlockCmp> small_first_queue_;
+#else
+        std::priority_queue<Block, std::vector<Block>, BlockCmp> large_first_queue_;
+#endif
+    };
+
+    static const char *task_policy_name()
+    {
+#if GKH_TASK_POLICY == 1
+        return "fifo";
+#elif GKH_TASK_POLICY == 2
+        return "small";
+#else
+        return "large";
+#endif
+    }
 
     // MPI profiling 统计。
     // 只在 master 上汇总并写入 files/mpi_profile_npX.csv，避免影响 main.cpp 的标准输出格式。
@@ -138,7 +235,15 @@ namespace
 
     static void write_mpi_profile_csv(const MpiProfile &prof)
     {
-        const std::string filename = "files/mpi_profile_np" + std::to_string(prof.mpi_size) + ".csv";
+        std::string filename;
+#if GKH_TASK_POLICY == 0
+        // 默认主策略仍沿用原文件名，保证原有实验脚本和报告数据不受影响。
+        filename = "files/mpi_profile_np" + std::to_string(prof.mpi_size) + ".csv";
+#else
+        // 对照策略写入带策略名的文件，避免覆盖大块优先主版本的 profiling。
+        filename = std::string("files/mpi_profile_") + task_policy_name() +
+                   "_np" + std::to_string(prof.mpi_size) + ".csv";
+#endif
 
         std::ifstream check(filename);
         const bool need_header = (!check.good()) ||
@@ -728,7 +833,7 @@ namespace
 
         prof.init_total_blocks = static_cast<int>(init_blocks.size());
 
-        std::priority_queue<Block, std::vector<Block>, BlockCmp> task_queue;
+        TaskPool task_queue;
 
         for (const auto &blk : init_blocks)
         {
@@ -773,8 +878,7 @@ namespace
                 int worker = idle_workers.front();
                 idle_workers.pop_front();
 
-                Block blk = task_queue.top();
-                task_queue.pop();
+                Block blk = task_queue.pop();
 
                 const int len = blk.r - blk.l + 1;
                 prof.max_task_len = std::max(prof.max_task_len, len);
@@ -1267,12 +1371,15 @@ namespace
         const int len = r - l + 1;
         Matrix localB(len, len, 0.0);
 
+        // Matrix 使用 row-major 连续存储。局部块的每一行在 localB 中连续，
+        // 在全局 B 中对应行的 [l, r] 区间也连续，因此可以按行拷贝，
+        // 避免双层 at() 访问带来的重复下标计算和函数调用开销。
+        const int global_cols = B.cols();
         for (int i = 0; i < len; ++i)
         {
-            for (int j = 0; j < len; ++j)
-            {
-                localB.at(i, j) = B.at(l + i, l + j);
-            }
+            const double *src = B.data() + static_cast<long long>(l + i) * global_cols + l;
+            double *dst = localB.data() + static_cast<long long>(i) * len;
+            std::copy(src, src + len, dst);
         }
 
         return localB;
@@ -1283,12 +1390,13 @@ namespace
     {
         const int len = r - l + 1;
 
+        // 与 extract_block 对称地按行连续写回，提高 cache 友好性。
+        const int global_cols = B.cols();
         for (int i = 0; i < len; ++i)
         {
-            for (int j = 0; j < len; ++j)
-            {
-                B.at(l + i, l + j) = localB.at(i, j);
-            }
+            double *dst = B.data() + static_cast<long long>(l + i) * global_cols + l;
+            const double *src = localB.data() + static_cast<long long>(i) * len;
+            std::copy(src, src + len, dst);
         }
     }
 
