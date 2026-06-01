@@ -67,3 +67,54 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Build artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+main
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+compile_commands.json
+
+# PBS / cluster outputs
+test.o
+test.e
+*.pbs.o*
+*.pbs.e*
+*.log
+
+# Profiling / generated result files
+files/
+results/raw/
+mpi_profile_np*.csv
+profile_np*.csv
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.vscode/
+.idea/
+
+# LaTeX report artifacts, if you later add report sources
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
